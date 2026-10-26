@@ -57,6 +57,12 @@ async def eqa_main(*params):
     if del_all:
         return await bot.send(ctx, await del_question(ctx, del_all, True))
 
+    # 更换回答xxx 内容：问题只有一条回答时直接替换回答内容
+    # 没匹配到已登记的问题时返回 None，继续走下面的原有流程
+    replace_res = await replace_answer(ctx)
+    if replace_res is not None:
+        return await bot.send(ctx, replace_res)
+
     # 处理回答所有人的问题
     keyword = util.get_msg_keyword(config['comm']['answer_all'], msg, True)
     if keyword:
@@ -506,3 +512,112 @@ def _locate_question_key(target):
         return reg_db, target
 
     return None, None
+
+
+def _slice_message_segments(message, raw, start):
+    """取出 raw[start:] 对应的消息段。raw 必须等于 str(message)：
+    起点之前的段整个丢弃，起点所在的文本段只保留后半截，
+    图片/@等非文本段原样保留。"""
+    segs = []
+    offset = 0
+    for seg in message:
+        text = str(seg)
+        end = offset + len(text)
+        if end <= start:
+            offset = end
+            continue
+        if seg['type'] == 'text' and start > offset:
+            seg = MessageSegment.text(text[start - offset:])
+        segs.append(seg)
+    return segs
+
+
+# 更换回答xxx 内容：问题只有一条回答时直接替换回答内容
+async def replace_answer(ctx):
+    prefix = config['comm'].get('answer_replace')
+    if not prefix:
+        return None
+    raw = str(ctx['message'])
+    rest = util.get_msg_keyword(prefix, raw.lstrip(), True)
+    if not isinstance(rest, str):
+        return None
+
+    # 「更换回答」和问题之间的空白可有可无。问题与内容的分隔点有两类：
+    # 空白（发文字的习惯），或直接跟图片等非文本段（发图顺手不加空格）。
+    # 问题本身也可能带空格，所以逐个分隔点试：先全部按原文精确匹配，
+    # 都不中再把候选问题里的空白去掉兜底一遍（容忍「小 圆」这类手滑空格）；
+    # 一个都定位不到说明不是冲着已有问答来的，返回 None 走原有流程。
+    bounds = [(m.start(), m.end()) for m in re.finditer(r'\s+', rest)]
+    bounds += [(m.start(), m.start()) for m in re.finditer(r'\[CQ:[^\]]*\]', rest)]
+    bounds.sort()
+
+    hit = None
+    for strip_ws in (False, True):
+        for s, e in bounds:
+            q = rest[:s].strip()
+            if not q:
+                continue
+            cand = re.sub(r'\s+', '', q) if strip_ws else q
+            _db, key = _locate_question_key(cand)
+            if _db is not None:
+                hit = (_db, key, cand, e)
+                break
+        if hit:
+            break
+    if not hit:
+        return None
+    _db, key, q, content_off = hit
+
+    # 只统计本群可见的回答（超管设置的全群问答也算），口径和回答时一致
+    full = _db.get(key, [])
+    cands = util.filter_list(full, lambda x: x['group_id'] == ctx['group_id'] or (
+        x['user_id'] in admins if config['rule']['super_admin_is_all_group'] else False))
+    if not cands:
+        return None
+
+    content = rest[content_off:].strip()
+    if not content:
+        return '回答呢? 回答呢??'
+
+    if len(cands) > 1:
+        # 多条回答不动库里的数据：照常随机回一条（借 answer 的完整筛选逻辑），
+        # 再提示怎么删到只剩一条
+        ctx2 = dict(ctx)
+        ctx2['message'] = Message(key)
+        ctx2['raw_message'] = key
+        reply = await answer(ctx2)
+        hint = (f'这个问题有多条回答，我就不直接更换啦。'
+                f'可以先发「{config["comm"]["answer_delete"]}{q}」删除多余的回答（每发一次删一条），'
+                f'删到只剩一条后，再发「{prefix}{q} 新内容」就能直接更换了')
+        if reply:
+            return list(reply) + [MessageSegment.text('\n' + hint)]
+        return hint
+
+    # 只有一条：权限对齐删除规则——本人或管理员可改，群管改超管的设置看 can_delete_super_admin_qa
+    rec = cands[0]
+    is_super_admin = ctx['user_id'] in admins
+    if rec['user_id'] != ctx['user_id']:
+        if not (is_super_admin or util.is_group_admin(ctx)):
+            return '这条回答不是你设置的，不能更换哦'
+        if not is_super_admin and rec['user_id'] in admins and \
+                not config['rule']['can_delete_super_admin_qa']:
+            return '这条回答是超级管理员设置的，木有权限更换哦'
+
+    # 新内容从原消息里切出来，图片要走一遍缓存，和设置问答时一样
+    head_len = len(raw) - len(raw.lstrip())
+    new_msg = []
+    for seg in _slice_message_segments(ctx['message'], raw, head_len + len(prefix) + content_off):
+        if seg['type'] == 'image':
+            seg = await util.ms_handler_image(seg, config['rule']['use_cq_code_image_url'],
+                                              config['cache_dir'], b64=config['image_base64'])
+            if not seg:
+                return '图片缓存失败了啦！'
+        new_msg.append(seg)
+    if not new_msg:
+        return '回答呢? 回答呢??'
+
+    # 旧回答里的缓存图一并清掉；full 是刚解码出来的副本，改完整体写回才落库
+    util.delete_message_image_file(rec)
+    rec['message'] = new_msg
+    _db[key] = full
+    return '更换成功啦 来问问我吧！'

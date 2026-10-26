@@ -24,6 +24,9 @@ comm:
   # 删除设置的全部问答 只允许超级管理员这么操作
   answer_delete_all: 清空回答
 
+  # 直接更换某条问答的回答内容（仅当这个问题只有一条回答时生效）
+  answer_replace: 更换回答
+
   # 显示个人设置的问答
   show_question: 问答
 
