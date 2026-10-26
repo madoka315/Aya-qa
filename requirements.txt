@@ -1,0 +1,4 @@
+pyyaml
+sqlitedict
+requests
+Pillow<10
